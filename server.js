@@ -1,83 +1,308 @@
 require('dotenv').config();
 const express = require('express');
-const http = require('http');
+const mongoose = require('mongoose');
 const cors = require('cors');
-const morgan = require('morgan');
+const cookieParser = require('cookie-parser');
 const path = require('path');
-const rateLimit = require('express-rate-limit');
-
-// Database and Socket Config
-const connectDB = require('./config/db');
-const errorHandler = require('./middleware/errorHandler');
-const initSocket = require('./socket');
-
-// Route Imports
-const authRoutes = require('./routes/auth');
-const postRoutes = require('./routes/posts');
-const userRoutes = require("./routes/users");
-const liveRoutes = require('./routes/live');
-const notificationRoutes = require('./routes/notifications');
-const messageRoutes = require('./routes/messages');
-const triviaRoutes = require('./routes/trivia');
-const groupRoutes = require('./routes/groups');
-const pageRoutes = require('./routes/pages');
-const meetingRoutes = require('./routes/meetingRoutes');
-const libraryRoutes = require('./routes/library');
+const http = require('http');
+const { Server } = require('socket.io');
+const Meeting = require('./models/Meeting');
 
 const app = express();
+const PORT = process.env.PORT || 4000;
+
 const server = http.createServer(app);
+const io = new Server(server, {
+  cors: {
+    origin: ['http://localhost:5173', 'http://127.0.0.1:5173', 'http://localhost:3000', 'http://127.0.0.1:3000'],
+    credentials: true
+  }
+});
 
-// Initialize DB and Real-time Engine
-connectDB();
-initSocket(server);
+app.set('io', io);
 
-// Security & Middleware
+// Tracking map to bind active socket connections to workspace profile identities
+const activeConnections = new Map();
+
+// ─── INTEGRATED PROFESSIONAL SOCKET ENGINE ───
+io.on('connection', (socket) => {
+
+  // --- Real-time Host Gate Knocking & Room Approval Engine ---
+  socket.on('knock_room', async ({ roomId, user }) => {
+    try {
+      if (!user) return;
+      const extractedUserId = user.id || user._id;
+      if (!extractedUserId) return;
+      
+      // Save identity map state reference securely
+      activeConnections.set(socket.id, { id: extractedUserId, username: user.username, roomId });
+
+      const meeting = await Meeting.findOne({ roomId });
+      if (!meeting) {
+        socket.emit('knock_status', { status: 'rejected', message: 'Gathering room not found.' });
+        return;
+      }
+
+      // Handle dual key structures matching both MongoDB object architectures
+      const isTrueHost = meeting.host && meeting.host.toString() === extractedUserId.toString();
+
+      if (isTrueHost) {
+        socket.emit('knock_status', { status: 'approved' });
+        return;
+      }
+
+      // Add user to the live backend pending database list if they aren't the creator
+      const knocker = { socketId: socket.id, userId: extractedUserId, username: user.username };
+      
+      // Prevent duplicates in queue arrays
+      await Meeting.findOneAndUpdate(
+        { roomId },
+        { $pull: { pendingApprovals: { userId: extractedUserId } } }
+      );
+      
+      await Meeting.findOneAndUpdate(
+        { roomId },
+        { $push: { pendingApprovals: knocker } }
+      );
+
+      // Dispatch real-time notification loop directly to the room room channel space
+      io.to(roomId).emit('user_knocking', knocker);
+      socket.emit('knock_status', { status: 'pending' });
+    } catch (err) {
+      console.error("Knock processing failure:", err);
+      socket.emit('knock_status', { status: 'rejected', message: 'Server security gate error.' });
+    }
+  });
+
+  socket.on('accept_knock', async ({ roomId, targetSocketId, targetUserId }) => {
+    try {
+      await Meeting.findOneAndUpdate(
+        { roomId },
+        { $pull: { pendingApprovals: { userId: targetUserId } } }
+      );
+      io.to(targetSocketId).emit('knock_status', { status: 'approved' });
+    } catch (err) {
+      console.error(err);
+    }
+  });
+
+  socket.on('reject_knock', async ({ roomId, targetSocketId, targetUserId }) => {
+    try {
+      await Meeting.findOneAndUpdate(
+        { roomId },
+        { $pull: { pendingApprovals: { userId: targetUserId } } }
+      );
+      io.to(targetSocketId).emit('knock_status', { status: 'rejected', message: 'Entry request declined by host.' });
+    } catch (err) {
+      console.error(err);
+    }
+  });
+
+  socket.on('join_meeting', async (roomId) => {
+    socket.join(roomId);
+    
+    try {
+      const meeting = await Meeting.findOne({ roomId });
+      if (meeting) {
+        socket.emit('load_chat_history', meeting.chatHistory || []);
+        
+        // Dynamically compile active directory roster lists based on mapping references
+        const roster = [];
+        const clients = io.sockets.adapter.rooms.get(roomId);
+        if (clients) {
+          for (const clientId of clients) {
+            const meta = activeConnections.get(clientId);
+            if (meta) {
+              roster.push({ userId: meta.id, username: meta.username });
+            }
+          }
+        }
+        
+        // If roster map composition returns blank, fallback cleanly to identity metadata
+        if (roster.length === 0 && activeConnections.has(socket.id)) {
+          const current = activeConnections.get(socket.id);
+          roster.push({ userId: current.id, username: current.username });
+        }
+
+        io.to(roomId).emit('update_room_roster', roster);
+      }
+    } catch (err) {
+      console.error(err);
+    }
+  });
+
+  // --- Layout Chat Synchronization ---
+  socket.on('send_meeting_chat', async ({ roomId, text, sender, time }) => {
+    const chatMsg = { sender, text, time: time || new Date() };
+    io.to(roomId).emit('receive_meeting_chat', chatMsg);
+
+    try {
+      await Meeting.findOneAndUpdate(
+        { roomId },
+        { $push: { chatHistory: chatMsg } }
+      );
+    } catch (err) {
+      console.error("Failed saving meeting chat log:", err);
+    }
+  });
+
+  // --- Dynamic Live Reaction Sync Dispatcher ---
+  socket.on('send_reaction', ({ roomId, emoji, id }) => {
+    io.to(roomId).emit('receive_reaction', { emoji, id });
+  });
+
+  // --- Disconnection Housekeeping Pipeline Engine ---
+  socket.on('disconnect', async () => {
+    const meta = activeConnections.get(socket.id);
+    if (meta) {
+      const { roomId } = meta;
+      activeConnections.delete(socket.id);
+      
+      try {
+        await Meeting.findOneAndUpdate(
+          { roomId },
+          { $pull: { pendingApprovals: { socketId: socket.id } } }
+        );
+        
+        // Re-compile roster array list configuration mapping metrics for remaining connections
+        const roster = [];
+        const clients = io.sockets.adapter.rooms.get(roomId);
+        if (clients) {
+          for (const clientId of clients) {
+            const innerMeta = activeConnections.get(clientId);
+            if (innerMeta) roster.push({ userId: innerMeta.id, username: innerMeta.username });
+          }
+        }
+        io.to(roomId).emit('update_room_roster', roster);
+      } catch (err) {
+        console.error(err);
+      }
+    }
+  });
+
+  // --- Fallback & Legacy Messaging Hub Connections ---
+  socket.on('register', (userId) => { socket.join(userId); });
+  socket.on('join-user-room', (userId) => { socket.join(userId); });
+  
+  socket.on('send_message', (msgData) => {
+    io.to(msgData.receiverId || msgData.recipient).emit('receive_message', msgData);
+  });
+  
+  socket.on('message_reaction', (reactionData) => {
+    io.to(reactionData.receiverId).emit('receive_reaction', reactionData);
+  });
+});
+
 app.use(cors({
-  origin: process.env.CLIENT_URL || 'http://localhost:5173',
-  credentials: true
+  origin: ['http://localhost:5173', 'http://127.0.0.1:5173', 'http://localhost:3000', 'http://127.0.0.1:3000'],
+  credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'x-auth-token', 'x-user-verified']
 }));
 
-app.use(express.json());
-app.use(morgan('dev'));
-
-const limiter = rateLimit({
-  windowMs: 15 * 60 * 1000,
-  max: 100,
-  message: { error: 'Too many requests, please try again later.' }
+app.use((req, res, next) => {
+  if (req.method === 'OPTIONS') return res.sendStatus(200);
+  next();
 });
-app.use('/api/', limiter);
 
-// Static Folders
+app.use(express.json({ limit: '50mb' }));
+app.use(express.urlencoded({ limit: '50mb', extended: true }));
+app.use(cookieParser());
 app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 
-// API Routes Mapping
-app.use('/api/auth', authRoutes);
-app.use('/api/posts', postRoutes);
-app.use('/api/users', userRoutes);
-app.use('/api/live', liveRoutes);
-app.use('/api/notifications', notificationRoutes);
-app.use('/api/messages', messageRoutes);
-app.use('/api/trivia', triviaRoutes);
-app.use('/api/groups', groupRoutes);
-app.use('/api/pages', pageRoutes);
-app.use('/api/meetings', meetingRoutes);
-app.use('/api/library', libraryRoutes);
+app.use((req, res, next) => {
+  if (req.originalUrl.includes('socket.io')) return next();
+  const start = Date.now();
+  res.on('finish', () => {
+    const duration = Date.now() - start;
+    const statusColor = res.statusCode >= 200 && res.statusCode < 400 ? '\x1b[32m' : '\x1b[31m';
+    console.log(`${req.method} ${req.originalUrl} ${statusColor}${res.statusCode}\x1b[0m - ${duration}ms`);
+  });
+  next();
+});
 
-// Health Check
-app.get('/api/health', (req, res) => res.json({
-  status: 'AdventConnect Engine Online ✅',
-  time: new Date()
-}));
+// App Routes Bindings
+app.use('/api/auth', require('./routes/auth'));
+app.use('/api/library', require('./routes/library'));
+app.use('/api/library/books', require('./routes/library/books'));
+app.use('/api/library/egw', require('./routes/library/egw'));
+app.use('/api/challenges', require('./routes/challenges'));
+app.use('/api/posts', require('./routes/posts'));
+app.use('/api/users', require('./routes/users'));
+app.use('/api/groups', require('./routes/groups'));
+app.use('/api/live', require('./routes/live'));
+app.use('/api/messages', require('./routes/messages'));
+app.use('/api/notifications', require('./routes/notifications'));
+app.use('/api/pages', require('./routes/pages'));
+app.use('/api/trivia', require('./routes/trivia'));
+app.use('/api/meetings', require('./routes/meetingRoutes'));
+app.use('/api/search', require('./routes/search'));
 
-app.use(errorHandler);
+app.get('/', (req, res) => {
+  res.json({ status: "online", system: "AdventConnect Ecosystem API" });
+});
 
-const PORT = process.env.PORT || 4000;
-server.listen(PORT, () => {
-  console.log(`
-  🚀 ADVENTCONNECT BACKEND ACTIVE
-  ------------------------------
-  Port: ${PORT}
-  Database: Connected
-  ------------------------------
-  `);
+mongoose.connect(process.env.MONGO_URI || 'mongodb://127.0.0.1:27017/adventconnect')
+  .then(() => {
+    server.listen(PORT, () => {
+      console.log('\n  🚀 ADVENTCONNECT BACKEND ACTIVE');
+      console.log('  ------------------------------');
+      console.log(`  Port: ${PORT}`);
+      console.log('  Database: Connected');
+      console.log('  ------------------------------\n');
+    });
+  })
+  .catch((err) => { console.error('❌ Database connection crash:', err); });
+
+// --- REGISTER MUSIC CHALLENGES ROUTE ENGINE ---
+try {
+  const challengeRoutes = require('./routes/challenges');
+  app.use('/api/challenges', challengeRoutes);
+  console.log(' ✅ Music Challenges Engine Linked Successfully');
+} catch (err) {
+  console.error(' ❌ Failed to inject Challenge Routes:', err.message);
+}
+
+// ─── SILENT GEOLOCATION ANALYTICS MIDDLEWARE ───
+// Automatically captures approximate location via IP for backend insights and localized ads
+const axios = require('axios');
+const User = require('./models/User');
+
+app.use(async (req, res, next) => {
+  // Move to next lifecycle immediately so we never block or delay the user request
+  next();
+
+  // Run the data collection asynchronously in the background
+  try {
+    // Only track authenticated users who have their ID stored in the request object (via auth middleware)
+    if (!req.user || !req.user.id) return;
+
+    // Capture the client IP address safely (handling proxies if hosted behind Nginx, cloudflare, etc.)
+    let clientIp = req.headers['x-forwarded-for'] || req.socket.remoteAddress;
+    
+    // Normalize localhost IPs for testing environments (fallback to a default city for system simulation if local)
+    if (clientIp === '::1' || clientIp === '127.0.0.1' || clientIp.includes('::ffff:127.0.0.1')) {
+      clientIp = '102.134.149.0'; // Default sample Kenyan IP registry block for staging environment analytics
+    }
+
+    // Call the network location pipeline provider silently
+    const geoResponse = await axios.get(`http://ip-api.com/json/${clientIp}`, { timeout: 3000 }).catch(() => null);
+
+    if (geoResponse && geoResponse.data && geoResponse.data.status === 'success') {
+      const { country, regionName, city, lat, lon } = geoResponse.data;
+      const formattedCity = `${city}, ${regionName}, ${country}`;
+
+      // Silently update user records with analytics telemetry in the background
+      await User.findByIdAndUpdate(req.user.id, {
+        currentCity: formattedCity,
+        locationCoordinates: {
+          type: 'Point',
+          coordinates: [parseFloat(lon), parseFloat(lat)] // [Longitude, Latitude] schema structure rules
+        }
+      });
+    }
+  } catch (silentErr) {
+    // Graceful exception shield: Never leak tracking errors or interrupt the platform operations
+    console.log("⚙️ Silent Analytics Background Tracker Sync bypassed cleanly.");
+  }
 });
