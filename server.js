@@ -1,11 +1,11 @@
 require('dotenv').config();
 const express = require('express');
-const mongoose = require('mongoose');
 const cors = require('cors');
 const cookieParser = require('cookie-parser');
 const path = require('path');
 const http = require('http');
 const { Server } = require('socket.io');
+const connectDB = require('./config/db'); // Smart environment DB entrypoint
 const Meeting = require('./models/Meeting');
 
 const app = express();
@@ -193,11 +193,12 @@ io.on('connection', (socket) => {
   });
 });
 
+// GLOBAL CORS SECURITY DEFINITION SETUPS
 app.use(cors({
   origin: ['http://localhost:5173', 'http://127.0.0.1:5173', 'http://localhost:3000', 'http://127.0.0.1:3000'],
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'x-auth-token', 'x-user-verified']
+  allowedHeaders: ['Content-Type', 'Authorization', 'x-auth-token', 'x-user-verified', 'x-user-location']
 }));
 
 app.use((req, res, next) => {
@@ -208,7 +209,18 @@ app.use((req, res, next) => {
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ limit: '50mb', extended: true }));
 app.use(cookieParser());
-app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
+
+// 🔥 FIXED: Injected Explicit CORS policy filters inside file stream headers for audio extraction pipelines
+app.use('/uploads', (req, res, next) => {
+  res.header("Access-Control-Allow-Origin", "*");
+  res.header("Access-Control-Allow-Methods", "GET, HEAD, OPTIONS");
+  res.header("Access-Control-Allow-Headers", "Origin, X-Requested-With, Content-Type, Accept, Range");
+  
+  if (req.method === 'OPTIONS') {
+    return res.sendStatus(200);
+  }
+  next();
+}, express.static(path.join(__dirname, 'uploads')));
 
 app.use((req, res, next) => {
   if (req.originalUrl.includes('socket.io')) return next();
@@ -242,67 +254,52 @@ app.get('/', (req, res) => {
   res.json({ status: "online", system: "AdventConnect Ecosystem API" });
 });
 
-mongoose.connect(process.env.MONGO_URI || 'mongodb://127.0.0.1:27017/adventconnect')
-  .then(() => {
-    server.listen(PORT, () => {
-      console.log('\n  🚀 ADVENTCONNECT BACKEND ACTIVE');
-      console.log('  ------------------------------');
-      console.log(`  Port: ${PORT}`);
-      console.log('  Database: Connected');
-      console.log('  ------------------------------\n');
-    });
-  })
-  .catch((err) => { console.error('❌ Database connection crash:', err); });
+// Clean initialization workflow routing through centralized smart DB switcher
+const startServer = async () => {
+  await connectDB();
+  
+  server.listen(PORT, () => {
+    console.log('\n  🚀 ADVENTCONNECT BACKEND ACTIVE');
+    console.log('  ------------------------------');
+    console.log(`  Port: ${PORT}`);
+    console.log('  Database: Initialization Check Active');
+    console.log('  ------------------------------\n');
+  });
+};
 
-// --- REGISTER MUSIC CHALLENGES ROUTE ENGINE ---
-try {
-  const challengeRoutes = require('./routes/challenges');
-  app.use('/api/challenges', challengeRoutes);
-  console.log(' ✅ Music Challenges Engine Linked Successfully');
-} catch (err) {
-  console.error(' ❌ Failed to inject Challenge Routes:', err.message);
-}
+startServer();
 
 // ─── SILENT GEOLOCATION ANALYTICS MIDDLEWARE ───
-// Automatically captures approximate location via IP for backend insights and localized ads
 const axios = require('axios');
 const User = require('./models/User');
 
 app.use(async (req, res, next) => {
-  // Move to next lifecycle immediately so we never block or delay the user request
   next();
 
-  // Run the data collection asynchronously in the background
   try {
-    // Only track authenticated users who have their ID stored in the request object (via auth middleware)
     if (!req.user || !req.user.id) return;
 
-    // Capture the client IP address safely (handling proxies if hosted behind Nginx, cloudflare, etc.)
     let clientIp = req.headers['x-forwarded-for'] || req.socket.remoteAddress;
     
-    // Normalize localhost IPs for testing environments (fallback to a default city for system simulation if local)
     if (clientIp === '::1' || clientIp === '127.0.0.1' || clientIp.includes('::ffff:127.0.0.1')) {
-      clientIp = '102.134.149.0'; // Default sample Kenyan IP registry block for staging environment analytics
+      clientIp = '102.134.149.0'; 
     }
 
-    // Call the network location pipeline provider silently
     const geoResponse = await axios.get(`http://ip-api.com/json/${clientIp}`, { timeout: 3000 }).catch(() => null);
 
     if (geoResponse && geoResponse.data && geoResponse.data.status === 'success') {
       const { country, regionName, city, lat, lon } = geoResponse.data;
       const formattedCity = `${city}, ${regionName}, ${country}`;
 
-      // Silently update user records with analytics telemetry in the background
       await User.findByIdAndUpdate(req.user.id, {
         currentCity: formattedCity,
         locationCoordinates: {
           type: 'Point',
-          coordinates: [parseFloat(lon), parseFloat(lat)] // [Longitude, Latitude] schema structure rules
+          coordinates: [parseFloat(lon), parseFloat(lat)] 
         }
       });
     }
   } catch (silentErr) {
-    // Graceful exception shield: Never leak tracking errors or interrupt the platform operations
-    console.log("⚙️ Silent Analytics Background Tracker Sync bypassed cleanly.");
+    console.log("⚙ISO Background Analytics Sync bypassed cleanly.");
   }
 });
