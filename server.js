@@ -7,6 +7,7 @@ const http = require('http');
 const { Server } = require('socket.io');
 const connectDB = require('./config/db'); // Smart environment DB entrypoint
 const Meeting = require('./models/Meeting');
+const User = require('./models/User'); // Required for directory collection and analytics
 
 const app = express();
 const PORT = process.env.PORT || 4000;
@@ -23,6 +24,9 @@ app.set('io', io);
 
 // Tracking map to bind active socket connections to workspace profile identities
 const activeConnections = new Map();
+
+// Authentication middleware wrapper definition for internal directory mappings
+const auth = require('./middleware/auth'); // Ensure your middleware file handles verifying standard JWT tokens
 
 // ─── INTEGRATED PROFESSIONAL SOCKET ENGINE ───
 io.on('connection', (socket) => {
@@ -233,6 +237,27 @@ app.use((req, res, next) => {
   next();
 });
 
+// 🔥 NEW ADDITION: Endpoint specifically matching frontend Directory lists to solve 404
+app.get('/api/users/chat-directory', auth, async (req, res) => {
+  try {
+    const currentUserId = req.user.id || req.user._id;
+
+    // Fetch active friends list mapping (adjust filters based on your schema structure)
+    const friends = await User.find({ _id: { $ne: currentUserId } }, 'username profilePic localChurch');
+    
+    // Simple mock algorithm suggestion metrics
+    const suggestions = await User.find({ _id: { $ne: currentUserId } }).limit(5);
+
+    res.json({
+      friends: friends || [],
+      suggestions: suggestions || []
+    });
+  } catch (err) {
+    console.error("Error loading chat directory database entries:", err);
+    res.status(500).json({ error: "Directory compile failed." });
+  }
+});
+
 // App Routes Bindings
 app.use('/api/auth', require('./routes/auth'));
 app.use('/api/library', require('./routes/library'));
@@ -271,7 +296,6 @@ startServer();
 
 // ─── SILENT GEOLOCATION ANALYTICS MIDDLEWARE ───
 const axios = require('axios');
-const User = require('./models/User');
 
 app.use(async (req, res, next) => {
   next();
