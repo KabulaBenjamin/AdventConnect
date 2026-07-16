@@ -4,29 +4,54 @@ const cors = require('cors');
 const cookieParser = require('cookie-parser');
 const path = require('path');
 const http = require('http');
+const axios = require('axios');
 const { Server } = require('socket.io');
+const { ExpressPeerServer } = require('peer'); // Imported PeerJS server framework
 const connectDB = require('./config/db'); // Smart environment DB entrypoint
 const Meeting = require('./models/Meeting');
 const User = require('./models/User'); // Required for directory collection and analytics
 
 const app = express();
 const PORT = process.env.PORT || 4000;
+const PEER_PORT = process.env.PEER_PORT || 9000; // Dedicated, isolated port for WebRTC signaling
+
+// Dynamic list of allowed frontend origins
+const allowedOrigins = [
+  'http://localhost:5173',
+  'http://127.0.0.1:5173',
+  'http://localhost:3000',
+  'http://127.0.0.1:3000'
+];
 
 const server = http.createServer(app);
+
+// 1. Configure Socket.io on the main HTTP server
 const io = new Server(server, {
   cors: {
-    origin: ['http://localhost:5173', 'http://127.0.0.1:5173', 'http://localhost:3000', 'http://127.0.0.1:3000'],
+    origin: allowedOrigins,
+    methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
     credentials: true
   }
 });
 
 app.set('io', io);
 
+// 2. 🔥 ISOLATED PEERJS ENGINE: Spawn a separate HTTP Server to prevent 'upgrade' event clashing
+const peerApp = express();
+const peerServer = http.createServer(peerApp);
+const expressPeerServer = ExpressPeerServer(peerServer, {
+  debug: false,
+  path: '/'
+});
+
+peerApp.use(cors({ origin: allowedOrigins, credentials: true }));
+peerApp.use('/', expressPeerServer);
+
 // Tracking map to bind active socket connections to workspace profile identities
 const activeConnections = new Map();
 
 // Authentication middleware wrapper definition for internal directory mappings
-const auth = require('./middleware/auth'); // Ensure your middleware file handles verifying standard JWT tokens
+const auth = require('./middleware/auth'); 
 
 // ─── INTEGRATED PROFESSIONAL SOCKET ENGINE ───
 io.on('connection', (socket) => {
@@ -38,7 +63,6 @@ io.on('connection', (socket) => {
       const extractedUserId = user.id || user._id;
       if (!extractedUserId) return;
       
-      // Save identity map state reference securely
       activeConnections.set(socket.id, { id: extractedUserId, username: user.username, roomId });
 
       const meeting = await Meeting.findOne({ roomId });
@@ -47,7 +71,6 @@ io.on('connection', (socket) => {
         return;
       }
 
-      // Handle dual key structures matching both MongoDB object architectures
       const isTrueHost = meeting.host && meeting.host.toString() === extractedUserId.toString();
 
       if (isTrueHost) {
@@ -55,10 +78,8 @@ io.on('connection', (socket) => {
         return;
       }
 
-      // Add user to the live backend pending database list if they aren't the creator
       const knocker = { socketId: socket.id, userId: extractedUserId, username: user.username };
       
-      // Prevent duplicates in queue arrays
       await Meeting.findOneAndUpdate(
         { roomId },
         { $pull: { pendingApprovals: { userId: extractedUserId } } }
@@ -69,7 +90,6 @@ io.on('connection', (socket) => {
         { $push: { pendingApprovals: knocker } }
       );
 
-      // Dispatch real-time notification loop directly to the room room channel space
       io.to(roomId).emit('user_knocking', knocker);
       socket.emit('knock_status', { status: 'pending' });
     } catch (err) {
@@ -110,7 +130,6 @@ io.on('connection', (socket) => {
       if (meeting) {
         socket.emit('load_chat_history', meeting.chatHistory || []);
         
-        // Dynamically compile active directory roster lists based on mapping references
         const roster = [];
         const clients = io.sockets.adapter.rooms.get(roomId);
         if (clients) {
@@ -122,7 +141,6 @@ io.on('connection', (socket) => {
           }
         }
         
-        // If roster map composition returns blank, fallback cleanly to identity metadata
         if (roster.length === 0 && activeConnections.has(socket.id)) {
           const current = activeConnections.get(socket.id);
           roster.push({ userId: current.id, username: current.username });
@@ -168,7 +186,6 @@ io.on('connection', (socket) => {
           { $pull: { pendingApprovals: { socketId: socket.id } } }
         );
         
-        // Re-compile roster array list configuration mapping metrics for remaining connections
         const roster = [];
         const clients = io.sockets.adapter.rooms.get(roomId);
         if (clients) {
@@ -184,24 +201,34 @@ io.on('connection', (socket) => {
     }
   });
 
-  // --- Fallback & Legacy Messaging Hub Connections ---
   socket.on('register', (userId) => { socket.join(userId); });
   socket.on('join-user-room', (userId) => { socket.join(userId); });
   
   socket.on('send_message', (msgData) => {
-    io.to(msgData.receiverId || msgData.recipient).emit('receive_message', msgData);
+    const targetRoom = msgData.receiverId || msgData.recipient;
+    if (targetRoom) {
+      io.to(targetRoom).emit('receive_message', msgData);
+    }
   });
   
   socket.on('message_reaction', (reactionData) => {
-    io.to(reactionData.receiverId).emit('receive_reaction', reactionData);
+    if (reactionData.receiverId) {
+      io.to(reactionData.receiverId).emit('receive_reaction', reactionData);
+    }
   });
 });
 
 // GLOBAL CORS SECURITY DEFINITION SETUPS
 app.use(cors({
-  origin: ['http://localhost:5173', 'http://127.0.0.1:5173', 'http://localhost:3000', 'http://127.0.0.1:3000'],
+  origin: (origin, callback) => {
+    if (!origin || allowedOrigins.indexOf(origin) !== -1) {
+      callback(null, true);
+    } else {
+      callback(new Error('Blocked by CORS policy'));
+    }
+  },
   credentials: true,
-  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization', 'x-auth-token', 'x-user-verified', 'x-user-location']
 }));
 
@@ -214,18 +241,15 @@ app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ limit: '50mb', extended: true }));
 app.use(cookieParser());
 
-// 🔥 FIXED: Injected Explicit CORS policy filters inside file stream headers for audio extraction pipelines
 app.use('/uploads', (req, res, next) => {
   res.header("Access-Control-Allow-Origin", "*");
   res.header("Access-Control-Allow-Methods", "GET, HEAD, OPTIONS");
   res.header("Access-Control-Allow-Headers", "Origin, X-Requested-With, Content-Type, Accept, Range");
-  
-  if (req.method === 'OPTIONS') {
-    return res.sendStatus(200);
-  }
+  if (req.method === 'OPTIONS') return res.sendStatus(200);
   next();
 }, express.static(path.join(__dirname, 'uploads')));
 
+// Middleware for measuring and outputting API endpoint response durations
 app.use((req, res, next) => {
   if (req.originalUrl.includes('socket.io')) return next();
   const start = Date.now();
@@ -237,24 +261,33 @@ app.use((req, res, next) => {
   next();
 });
 
-// 🔥 NEW ADDITION: Endpoint specifically matching frontend Directory lists to solve 404
+// Directory routes
 app.get('/api/users/chat-directory', auth, async (req, res) => {
   try {
     const currentUserId = req.user.id || req.user._id;
-
-    // Fetch active friends list mapping (adjust filters based on your schema structure)
     const friends = await User.find({ _id: { $ne: currentUserId } }, 'username profilePic localChurch');
-    
-    // Simple mock algorithm suggestion metrics
     const suggestions = await User.find({ _id: { $ne: currentUserId } }).limit(5);
-
-    res.json({
-      friends: friends || [],
-      suggestions: suggestions || []
-    });
+    res.json({ friends: friends || [], suggestions: suggestions || [] });
   } catch (err) {
     console.error("Error loading chat directory database entries:", err);
     res.status(500).json({ error: "Directory compile failed." });
+  }
+});
+
+// 🔥 INTEGRATED ROUTE: Get logged-in user's accepted friends list safely (Resolves the 404!)
+app.get('/api/users/friends', auth, async (req, res) => {
+  try {
+    const currentUserId = req.user.id || req.user._id;
+    const userInstance = await User.findById(currentUserId).populate('friends', 'username avatar localChurch currentCity');
+    
+    if (!userInstance) {
+      return res.status(404).json({ error: "User registry profile not found." });
+    }
+    
+    res.json(userInstance.friends || []);
+  } catch (err) {
+    console.error("❌ Error fetching friends list:", err);
+    res.status(500).json({ error: "Failed to retrieve connected friends list." });
   }
 });
 
@@ -279,51 +312,50 @@ app.get('/', (req, res) => {
   res.json({ status: "online", system: "AdventConnect Ecosystem API" });
 });
 
-// Clean initialization workflow routing through centralized smart DB switcher
+// --- GEOLOCATION BACKGROUND SYNC MIDDLEWARE ---
+// (Moved below routes and cleanly async-chained to prevent execution blocking)
+app.use(async (req, res, next) => {
+  next();
+  try {
+    if (!req.user || !(req.user.id || req.user._id)) return;
+    const currentUserId = req.user.id || req.user._id;
+
+    let clientIp = req.headers['x-forwarded-for'] || req.socket.remoteAddress;
+    if (clientIp === '::1' || clientIp === '127.0.0.1' || clientIp.includes('::ffff:127.0.0.1')) {
+      clientIp = '102.134.149.0'; 
+    }
+    
+    const geoResponse = await axios.get(`http://ip-api.com/json/${clientIp}`, { timeout: 3000 }).catch(() => null);
+    if (geoResponse && geoResponse.data && geoResponse.data.status === 'success') {
+      const { country, regionName, city, lat, lon } = geoResponse.data;
+      const formattedCity = `${city}, ${regionName}, ${country}`;
+      await User.findByIdAndUpdate(currentUserId, {
+        currentCity: formattedCity,
+        locationCoordinates: { type: 'Point', coordinates: [parseFloat(lon), parseFloat(lat)] }
+      });
+    }
+  } catch (silentErr) {
+    console.log("⚙️ ISO Background Analytics Sync bypassed cleanly.");
+  }
+});
+
+// Boot both servers in parallel
 const startServer = async () => {
   await connectDB();
   
+  // Start Main Socket.IO Server
   server.listen(PORT, () => {
     console.log('\n  🚀 ADVENTCONNECT BACKEND ACTIVE');
     console.log('  ------------------------------');
-    console.log(`  Port: ${PORT}`);
-    console.log('  Database: Initialization Check Active');
+    console.log(`  Main App Port: ${PORT} (Express + Socket.IO)`);
+    console.log('  ------------------------------\n');
+  });
+
+  // Start Independent PeerJS Server
+  peerServer.listen(PEER_PORT, () => {
+    console.log(`  📞 PeerJS signaling server active on port: ${PEER_PORT}`);
     console.log('  ------------------------------\n');
   });
 };
 
 startServer();
-
-// ─── SILENT GEOLOCATION ANALYTICS MIDDLEWARE ───
-const axios = require('axios');
-
-app.use(async (req, res, next) => {
-  next();
-
-  try {
-    if (!req.user || !req.user.id) return;
-
-    let clientIp = req.headers['x-forwarded-for'] || req.socket.remoteAddress;
-    
-    if (clientIp === '::1' || clientIp === '127.0.0.1' || clientIp.includes('::ffff:127.0.0.1')) {
-      clientIp = '102.134.149.0'; 
-    }
-
-    const geoResponse = await axios.get(`http://ip-api.com/json/${clientIp}`, { timeout: 3000 }).catch(() => null);
-
-    if (geoResponse && geoResponse.data && geoResponse.data.status === 'success') {
-      const { country, regionName, city, lat, lon } = geoResponse.data;
-      const formattedCity = `${city}, ${regionName}, ${country}`;
-
-      await User.findByIdAndUpdate(req.user.id, {
-        currentCity: formattedCity,
-        locationCoordinates: {
-          type: 'Point',
-          coordinates: [parseFloat(lon), parseFloat(lat)] 
-        }
-      });
-    }
-  } catch (silentErr) {
-    console.log("⚙ISO Background Analytics Sync bypassed cleanly.");
-  }
-});
