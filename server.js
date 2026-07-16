@@ -15,12 +15,13 @@ const app = express();
 const PORT = process.env.PORT || 4000;
 const PEER_PORT = process.env.PEER_PORT || 9000; // Dedicated, isolated port for WebRTC signaling
 
-// Dynamic list of allowed frontend origins
+// Dynamic list of allowed frontend origins (Updated to trust live production site)
 const allowedOrigins = [
   'http://localhost:5173',
   'http://127.0.0.1:5173',
   'http://localhost:3000',
-  'http://127.0.0.1:3000'
+  'http://127.0.0.1:3000',
+  'https://adventconnect-frontend.onrender.com' // Live Render Frontend
 ];
 
 const server = http.createServer(app);
